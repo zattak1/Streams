@@ -3302,6 +3302,22 @@ abstract class Streams extends Base_Streams
 			$query->where(array($prefix . 'weight' => $range));
 		}
 
+		// GOTCHA: this branch used to be missing entirely, so every caller passing
+		// $options['weight'] (Communities::filterEvents(), Places_Nearby::byTime(),
+		// Streams_RelatedTo::consume(), Calendars_Event::joinRandomUsers()) had its
+		// filter silently dropped -- the docblock advertised the option, and the Node
+		// implementation in classes/Streams.js honored it, but PHP only ever applied
+		// min/max. Symptom: event lists showed the oldest relations (2020 events) as
+		// "upcoming" and newer ones were unreachable past the limit. Never turn this
+		// back into a no-op; a dropped WHERE is invisible at the call site.
+		// The value is passed through verbatim (number, array or Db_Range) exactly as
+		// the Node side does, so Db_Query renders =, IN (...) or a BETWEEN-style range.
+		// Only meaningful when $isCategory is true: Streams_RelatedFrom has no weight
+		// column, which is what the docblock's "Only used if isCategory is true" means.
+		if ($isCategory and isset($options['weight'])) {
+			$query->where(array($prefix . 'weight' => $options['weight']));
+		}
+
 		if ($limit or $offset) {
 			$query->limit($limit, $offset);
 		}
