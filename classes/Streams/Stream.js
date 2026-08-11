@@ -450,21 +450,55 @@ Sp.notifyParticipants = function (event, messageOrEphemeral, dontNotifyObservers
 
 	// messageOrEphemeral.stream = stream;
 
+	var streamId = Streams_Stream.logId(this);
+
 	this.getParticipants({ skipAccess: true }, function (err, participants) {
-		var userIds = Object.keys(participants) || [];
-		for (var i = 0; i < userIds.length; i++) {
-			var userId = userIds[i];
-			var participant = participants[userId];
-			stream.notify(participant, event, messageOrEphemeral, function (err) {
-				callback && callback(err, participants);
-				if (!err) return;
-				var debug = Q.Config.get(["Streams", "notifications", "debug"], false);
-				if (debug) {
-					Q.log("Failed to notify user '" + participant.fields.userId + "': ");
-					Q.log(err);
-				}
-			});
+		// DO NOT remove this check. getParticipants() hands back `undefined` on any
+		// DB failure (dropped connection, MySQL restart, query timeout). This callback
+		// runs off the mysql driver's event loop turn, so a TypeError thrown here has
+		// nothing above it to catch: node reports UNCAUGHT EXCEPTION and *exits*, the
+		// supervisor restarts it, and every connected socket is dropped — a crash loop
+		// several times a minute under normal chat load. It used to read
+		// `Object.keys(participants) || []`, where the `|| []` looks like a guard but
+		// is evaluated after the throw. See docs/qbix-gotchas.md
+		// § "A DB error in a node callback exits the process".
+		if (err || !participants) {
+			Q.log("Streams.Stream.notifyParticipants: cannot get participants for stream "
+				+ streamId + ", event '" + event + "' NOT delivered: "
+				+ Streams_Stream.describeError(err
+					|| new Error("getParticipants returned no participants")));
+			return callback && callback(err
+				|| new Error("Streams.Stream.notifyParticipants: no participants returned"));
 		}
+		Object.keys(participants).forEach(function (userId) {
+			// `participant` must be per-iteration: the original used a `var` in a
+			// for-loop, so by the time an async notify() failed, the error log named
+			// whichever participant happened to be last.
+			var participant = participants[userId];
+			try {
+				stream.notify(participant, event, messageOrEphemeral, function (err) {
+					callback && callback(err, participants);
+					if (!err) return;
+					// Always log. This used to be gated behind the
+					// Streams/notifications/debug config, which defaults to false, so
+					// socket delivery failed completely silently in production and read
+					// as "flaky realtime" rather than as a dead DB connection.
+					Q.log("Streams.Stream.notifyParticipants: failed to notify user '"
+						+ userId + "' of event '" + event + "' on stream " + streamId
+						+ ": " + Streams_Stream.describeError(err));
+					if (Q.Config.get(["Streams", "notifications", "debug"], false)) {
+						Q.log(err);
+					}
+				});
+			} catch (e) {
+				// notify() can also throw synchronously — e.g. it calls
+				// messageOrEphemeral.getType(), and Streams/Stream/remove passes null.
+				// One bad participant must not take the whole process down.
+				Q.log("Streams.Stream.notifyParticipants: notify() threw for user '"
+					+ userId + "', event '" + event + "' on stream " + streamId
+					+ ": " + Streams_Stream.describeError(e));
+			}
+		});
 		if (!dontNotifyObservers) {
 			stream.notifyObservers(event, messageOrEphemeral);
 		}
@@ -483,16 +517,33 @@ Sp.notifyParticipants = function (event, messageOrEphemeral, dontNotifyObservers
 Sp.notifyObservers = function (event, messageOrEphemeral) {
 	var stream = this;
 	var fields = this.fields;
+	var streamId = Streams_Stream.logId(this);
 	this.getObservers(function (err, observers) {
-		var p = Object.getPrototypeOf(messageOrEphemeral);
-		var f;
+		// Same anti-pattern as notifyParticipants above, with the opposite symptom:
+		// `for (var x in undefined)` iterates zero times rather than throwing, so an
+		// access failure here dropped every observer's copy of the event with no
+		// trace in any log. Report it instead.
+		if (err) {
+			Q.log("Streams.Stream.notifyObservers: cannot get observers for stream "
+				+ streamId + ", event '" + event + "' NOT delivered to observers: "
+				+ Streams_Stream.describeError(err));
+			return;
+		}
 		for (var clientId in observers) {
-			observers[clientId].emit(event, messageOrEphemeral.getFields(), {
-				publisherId: stream.fields.publisherId,
-				streamName: stream.fields.name,
-				streamType: stream.fields.type,
-				messageCount: stream.fields.messageCount
-			});
+			try {
+				observers[clientId].emit(event, messageOrEphemeral.getFields(), {
+					publisherId: stream.fields.publisherId,
+					streamName: stream.fields.name,
+					streamType: stream.fields.type,
+					messageCount: stream.fields.messageCount
+				});
+			} catch (e) {
+				// One dead socket must not abort the fan-out to the others,
+				// nor take the process down from inside an async callback.
+				Q.log("Streams.Stream.notifyObservers: emit failed for client '"
+					+ clientId + "', event '" + event + "' on stream " + streamId
+					+ ": " + Streams_Stream.describeError(e));
+			}
 		}
 	});
 };
@@ -1853,6 +1904,52 @@ Streams_Stream.restrictedFromClient = function Streams_Stream_restrictedFromClie
 		return true;
 	}
 	return false;
+};
+
+/**
+ * A short "publisherId/streamName (type)" label for log lines, safe to call on a
+ * partially-constructed stream. Used by the notify* methods so that a delivery
+ * failure names the stream it failed on.
+ * @method logId
+ * @static
+ * @param {Streams_Stream} [stream]
+ * @return {String}
+ */
+Streams_Stream.logId = function Streams_Stream_logId(stream) {
+	var f = stream && stream.fields;
+	if (!f) {
+		return '(unknown stream)';
+	}
+	return (f.publisherId || '?') + '/' + (f.name || '?')
+		+ (f.type ? ' (' + f.type + ')' : '');
+};
+
+/**
+ * Render an error for a log line without assuming it is an Error instance —
+ * the Db layer and socket.io both hand back plain strings and plain objects.
+ * Keeps the stack when there is one, because the DB errors this exists for
+ * ("Can't add new command when connection is in closed state") are otherwise
+ * indistinguishable from each other in the log.
+ * @method describeError
+ * @static
+ * @param {Error|String|Object} err
+ * @return {String}
+ */
+Streams_Stream.describeError = function Streams_Stream_describeError(err) {
+	if (err == null) {
+		return '(no error given)';
+	}
+	if (err instanceof Error) {
+		return (err.code ? '[' + err.code + '] ' : '') + (err.stack || err.message);
+	}
+	if (typeof err === 'string') {
+		return err;
+	}
+	try {
+		return JSON.stringify(err);
+	} catch (e) {
+		return String(err);
+	}
 };
 
 module.exports = Streams_Stream;

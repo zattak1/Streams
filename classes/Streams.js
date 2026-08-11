@@ -520,7 +520,18 @@ Streams.listen = function (options, servers) {
 					streamName: streamName,
 					ordinal: new Db.Range(messageCount, false)
 				}).execute(function (err, rows) {
-					_continue(err ? [] : rows.map(row => row.fields));
+					if (err) {
+						// Same swallow as notifyParticipants/notifyObservers: a DB
+						// failure here silently backfills zero missed messages, so the
+						// observing client believes it is up to date. Log it — this is
+						// the "chat is flaky" symptom, not an empty stream.
+						Q.log("Streams/observe: could not load messages after ordinal "
+							+ messageCount + " for stream " + publisherId + "/" + streamName
+							+ "; observer will see no history: "
+							+ Streams.Stream.describeError(err));
+						return _continue([]);
+					}
+					_continue(rows.map(row => row.fields));
 				});
 			}
 			function _continue(messages) {
