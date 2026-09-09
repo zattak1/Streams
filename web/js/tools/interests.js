@@ -502,13 +502,24 @@ Q.Tool.define("Streams/interests", function (options) {
 						pipe.fill('my')({});
 					}
 
-					if (anotherUser) {
+					// Another user's interests are members-only on the server
+					// (Streams/interest/response/interests.php, ro#552). Asking
+					// for them while logged out is now a guaranteed error, and
+					// this tool turns every error into an alert() -- so a
+					// logged-out visitor to a profile page would get a modal
+					// instead of a quietly empty section. Don't ask.
+					if (anotherUser && Users.loggedInUser) {
 						Interests.forUser(state.userId, state.communityId, function (err, interests) {
 							if (err) {
 								return alert(Q.firstErrorMessage(err));
 							}
 							pipe.fill('anotherUser')(interests);
 						});
+					} else if (anotherUser) {
+						// The pipe at the top of this block is still waiting on
+						// 'anotherUser' (see waitFor above), so fill it empty
+						// rather than leaving the tool unrendered.
+						pipe.fill('anotherUser')({});
 					}
 				});
 			});

@@ -9,8 +9,19 @@ function Streams_avatar_response()
 	$asUserId = $user ? $user->id : "";
 
 	if (isset($prefix)) {
+		// Prefix search enumerates the user base -- ten avatars at a time, with
+		// first name, last name and username on each -- so it is for members,
+		// not for the anonymous public (ro#552). The old code did the opposite:
+		// `$prefix or !$asUserId` routed a logged-OUT caller into
+		// fetchByPrefix() even with an empty prefix, which is the whole
+		// directory. Nothing in the platform or in our apps calls this
+		// logged out: the callers are Streams/userChooser and the invite
+		// dialogs, all of which require a session already.
+		if (!$asUserId) {
+			throw new Users_Exception_NotLoggedIn();
+		}
 		$options = @compact('limit', 'public', 'communities', 'platform');
-		if ($prefix or !$asUserId) {
+		if ($prefix) {
 			$avatars = Streams_Avatar::fetchByPrefix(
 				$asUserId, 
 				$prefix, 
