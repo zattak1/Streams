@@ -15,6 +15,9 @@
  */
 function Streams_access_delete($params) {
 	$user = Users::loggedInUser(true);
+	// As PUT does. The dispatcher's own nonce check is enforcing only for
+	// AJAX requests; a form POST with Q.method=DELETE would skip it.
+	Q_Valid::nonce(true);
 	$r = array_merge($_REQUEST, $params);
 	Q_Valid::requireFields(array('publisherId', 'streamName'), $r, true);
 	$ofUserId = Q::ifset($r, 'ofUserId', '');
