@@ -1614,6 +1614,7 @@ class Streams_Stream extends Base_Streams_Stream
 	function getReadLevel($options = array())
 	{
 		$readLevel = $this->get('readLevel', $this->readLevel);
+		$invite = null;
 		if ($fields = Q::ifset($_SESSION, 'Streams', 'invite', array())) {
 			$invite = new Streams_Invite($fields);
 		} else if (Streams_Invite::$followed) {
