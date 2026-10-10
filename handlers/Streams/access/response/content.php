@@ -13,6 +13,9 @@ function Streams_access_response_content($options)
 	$stream->publisherId = $publisherId;
 	$stream->name = $streamName;
 	if (!$stream->retrieve()) {
+		// Creating from a GET slot: require the session nonce, so a
+		// cross-site navigation cannot create streams for a victim (ro#1083).
+		Q_Valid::nonce(true);
 		// try to create stream if it possibleUserStreams
 		Q::event('Streams/stream/post', array(
 			"publisherId" => $publisherId,
