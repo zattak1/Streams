@@ -445,64 +445,112 @@ Sp.ephemeral = function _Stream_ephemeral (
  * @return {Boolean} Whether the system went on to get and notify participants
  */
 Sp.notifyParticipants = function (event, messageOrEphemeral, dontNotifyObservers, callback) {
-	var fields = this.fields;
 	var stream = this;
 
 	// messageOrEphemeral.stream = stream;
 
 	var streamId = Streams_Stream.logId(this);
 
-	this.getParticipants({ skipAccess: true }, function (err, participants) {
-		// DO NOT remove this check. getParticipants() hands back `undefined` on any
-		// DB failure (dropped connection, MySQL restart, query timeout). This callback
-		// runs off the mysql driver's event loop turn, so a TypeError thrown here has
-		// nothing above it to catch: node reports UNCAUGHT EXCEPTION and *exits*, the
-		// supervisor restarts it, and every connected socket is dropped — a crash loop
-		// several times a minute under normal chat load. It used to read
-		// `Object.keys(participants) || []`, where the `|| []` looks like a guard but
-		// is evaluated after the throw. See docs/qbix-gotchas.md
-		// § "A DB error in a node callback exits the process".
-		if (err || !participants) {
-			Q.log("Streams.Stream.notifyParticipants: cannot get participants for stream "
-				+ streamId + ", event '" + event + "' NOT delivered: "
-				+ Streams_Stream.describeError(err
-					|| new Error("getParticipants returned no participants")));
-			return callback && callback(err
-				|| new Error("Streams.Stream.notifyParticipants: no participants returned"));
-		}
-		Object.keys(participants).forEach(function (userId) {
-			// `participant` must be per-iteration: the original used a `var` in a
-			// for-loop, so by the time an async notify() failed, the error log named
-			// whichever participant happened to be last.
-			var participant = participants[userId];
-			try {
-				stream.notify(participant, event, messageOrEphemeral, function (err) {
-					callback && callback(err, participants);
-					if (!err) return;
-					// Always log. This used to be gated behind the
-					// Streams/notifications/debug config, which defaults to false, so
-					// socket delivery failed completely silently in production and read
-					// as "flaky realtime" rather than as a dead DB connection.
-					Q.log("Streams.Stream.notifyParticipants: failed to notify user '"
-						+ userId + "' of event '" + event + "' on stream " + streamId
-						+ ": " + Streams_Stream.describeError(err));
-					if (Q.Config.get(["Streams", "notifications", "debug"], false)) {
-						Q.log(err);
-					}
-				});
-			} catch (e) {
-				// notify() can also throw synchronously — e.g. it calls
-				// messageOrEphemeral.getType(), and Streams/Stream/remove passes null.
-				// One bad participant must not take the whole process down.
-				Q.log("Streams.Stream.notifyParticipants: notify() threw for user '"
-					+ userId + "', event '" + event + "' on stream " + streamId
-					+ ": " + Streams_Stream.describeError(e));
+	// The fan-out walks the participants in batches, and computes access for a
+	// whole batch with a fixed number of queries (ro#1172). It used to fetch at
+	// most getParticipantsLimit (100) participants, newest first, and then run
+	// calculateAccess() once per participant: two streams_access queries each,
+	// all queued at once on the shard's single connection, each holding its
+	// cloned query objects until its turn. A post to a 100-member conversation
+	// held ~120 MB of node heap for ~10 s, so two posts in a row OOM-killed a
+	// 256M node. Every participant after the newest 100 never received the
+	// message at all. Now each batch costs one participants query plus two
+	// access queries (three with contact labels) whatever its size; the next
+	// batch is fetched only after this one's access is computed, so a post
+	// holds at most one batch of rows at a time however large the stream is.
+	// Offline notifications to subscribed participants still cost queries
+	// each; notify() runs those through a process-wide limit (_offlineSlot).
+	var batchSize = parseInt(Q.Config.get(['Streams', 'notifications', 'batchSize'], 100));
+	if (!(batchSize > 0)) {
+		batchSize = 100;
+	}
+	var notifiedObservers = false;
+	_batch(null);
+
+	function _batch(afterUserId) {
+		Streams_Stream.participantsAfter(stream, afterUserId, batchSize,
+		function (err, rows) {
+			// DO NOT remove this check. The DB layer hands back `undefined` on any
+			// DB failure (dropped connection, MySQL restart, query timeout). This callback
+			// runs off the mysql driver's event loop turn, so a TypeError thrown here has
+			// nothing above it to catch: node reports UNCAUGHT EXCEPTION and *exits*, the
+			// supervisor restarts it, and every connected socket is dropped — a crash loop
+			// several times a minute under normal chat load. It used to read
+			// `Object.keys(participants) || []`, where the `|| []` looks like a guard but
+			// is evaluated after the throw. See docs/qbix-gotchas.md
+			// § "A DB error in a node callback exits the process".
+			if (err || !rows) {
+				Q.log("Streams.Stream.notifyParticipants: cannot get participants for stream "
+					+ streamId + ", event '" + event + "' NOT delivered"
+					+ (afterUserId ? " to participants after '" + afterUserId + "'" : "")
+					+ ": " + Streams_Stream.describeError(err
+						|| new Error("getParticipants returned no participants")));
+				return callback && callback(err
+					|| new Error("Streams.Stream.notifyParticipants: no participants returned"));
 			}
+			var participants = {};
+			for (var i = 0; i < rows.length; ++i) {
+				participants[rows[i].fields.userId] = rows[i];
+			}
+			var userIds = Object.keys(participants);
+			// Observers are told once, as soon as the first batch was read, as
+			// before; their access was checked when they started observing.
+			if (!dontNotifyObservers && !notifiedObservers) {
+				notifiedObservers = true;
+				stream.notifyObservers(event, messageOrEphemeral);
+			}
+			Streams_Stream.calculateAccessForUsers(stream, userIds, participants,
+			function (err, views) {
+				if (err) {
+					// Fail closed: without a computed access level nobody in this
+					// batch may receive the event.
+					Q.log("Streams.Stream.notifyParticipants: cannot calculate access for stream "
+						+ streamId + ", event '" + event + "' NOT delivered to "
+						+ userIds.length + " participant(s): "
+						+ Streams_Stream.describeError(err));
+					return callback && callback(err, participants);
+				}
+				userIds.forEach(function (userId) {
+					_notifyOne(participants, userId, views[userId]);
+				});
+				if (rows.length >= batchSize) {
+					_batch(rows[rows.length - 1].fields.userId);
+				}
+			});
 		});
-		if (!dontNotifyObservers) {
-			stream.notifyObservers(event, messageOrEphemeral);
+	}
+
+	function _notifyOne(participants, userId, view) {
+		var participant = participants[userId];
+		try {
+			stream.notify(participant, event, messageOrEphemeral, function (err) {
+				callback && callback(err, participants);
+				if (!err) return;
+				// Always log. This used to be gated behind the
+				// Streams/notifications/debug config, which defaults to false, so
+				// socket delivery failed completely silently in production and read
+				// as "flaky realtime" rather than as a dead DB connection.
+				Q.log("Streams.Stream.notifyParticipants: failed to notify user '"
+					+ userId + "' of event '" + event + "' on stream " + streamId
+					+ ": " + Streams_Stream.describeError(err));
+				if (Q.Config.get(["Streams", "notifications", "debug"], false)) {
+					Q.log(err);
+				}
+			}, view);
+		} catch (e) {
+			// notify() can also throw synchronously — e.g. it calls
+			// messageOrEphemeral.getType(), and Streams/Stream/remove passes null.
+			// One bad participant must not take the whole process down.
+			Q.log("Streams.Stream.notifyParticipants: notify() threw for user '"
+				+ userId + "', event '" + event + "' on stream " + streamId
+				+ ": " + Streams_Stream.describeError(e));
 		}
-	});
+	}
 	return true;
 };
 
@@ -575,133 +623,48 @@ Sp.calculateAccess = function(asUserId, callback) {
 		return;
 	}
 	var subj = this;
-	var public_source = Streams.ACCESS_SOURCES['public'];
-	var direct_source = Streams.ACCESS_SOURCES['direct'];
 
-	this.set('asUserId', asUserId);
-	this.set('readLevel', this.fields.readLevel);
-	this.set('writeLevel', this.fields.writeLevel);
-	this.set('adminLevel', this.fields.adminLevel);
-	this.set('permissions', this.getAllPermissions());
-	this.set('readLevel_source', public_source);
-	this.set('writeLevel_source', public_source);
-	this.set('adminLevel_source', public_source);
-	this.set('permissions_source', public_source);
-
-	if (!asUserId) {
+	if (_resetAccess(subj, asUserId)) {
 		return callback.call(subj);
 	}
 
 	// For workspace publishers (e.g. "alice~ws1"), resolve access against
-	// the base publisher ("alice") so the owner still gets full access to
-	// their own workspace streams, and label/contact lookups work correctly.
-	var publisherIdForAccess = this.fields.publisherId;
-	var tildePos = publisherIdForAccess.indexOf('~');
-	if (tildePos !== -1) {
-		publisherIdForAccess = publisherIdForAccess.slice(0, tildePos);
-	}
-
-	if (asUserId && asUserId === publisherIdForAccess) {
-		var required = Q.Config.get(['Streams', 'requiredUserStreams', this.fields.name], false);
-		this.set('isRequired', required);
-		this.set('readLevel', Streams.READ_LEVEL['max']);
-		this.set('writeLevel', Streams.WRITE_LEVEL['max']);
-		this.set('adminLevel', Streams.ADMIN_LEVEL['max']);
-		this.set('readLevel_source', direct_source);
-		this.set('writeLevel_source', direct_source);
-		this.set('adminLevel_source', direct_source);
-		this.publishedByFetcher = true;
-		return callback.call(subj);
-	}
+	// the base publisher ("alice") so label/contact lookups work correctly.
+	var publisherIdForAccess = _publisherIdForAccess(subj);
 
 	var p = new Q.Pipe(['rows1', 'rows2'], function (res) {
-		var i, j, row;
 		var err = res.rows1[0] || res.rows2[0];
 		if (err) {
 			return callback.call(subj, err);
 		}
-		var rows1 = res.rows1[1];
-		var rows2 = res.rows2[1];
-		for (i = 0; i < rows2.length; ++i) {
-			var access = rows2[i].fields;
-			if (
-				access.ofUserId === '' &&
-				!access.ofContactLabel &&
-				!access.ofParticipantRole
-			) {
-				var head = access.streamName.slice(0, -1);
-				if (subj.fields.type === head) {
-					_setStreamAccess(subj, rows2[i], Streams.ACCESS_SOURCES['public']);
-				}
-			}
-		}
-		// Apply universal access overrides for concrete (non-mutable) rules
-		for (i = 0; i < rows1.length; ++i) {
-			var access = rows1[i].fields;
-			if (
-				access.publisherId === '' &&
-				access.ofUserId === '' &&
-				!access.ofContactLabel &&
-				!access.ofParticipantRole
-			) {
-				// Concrete universal rule: matches this exact stream name
-				if (access.streamName === subj.fields.name) {
-					_setStreamAccess(subj, rows1[i], Streams.ACCESS_SOURCES['public']);
-				}
-			}
-		}
-		var rows = rows1.concat([]);
-		theloop:
-		for (i=0; i<rows2.length; ++i) {
-			var row2 = rows2[i];
-			for (j=0; j<rows1.length; ++j) {
-				var row1 = rows1[j];
-				if (row2.fields.streamName
-				=== row1.fields.streamName + '*') {
-					// skip the mutable access, because
-					// explicit stream access overrides it
-					continue theloop;
-				}
-			}
-			rows.push(row2);
-		}
-		var labels = [];
-		var fetchParticipantRow = false;
-		for (i=0; i<rows.length; i++) {
-			row = rows[i];
-			if (row.fields.ofContactLabel) {
-				labels.push(row.fields.ofContactLabel);
-			}
-			if (row.fields.ofParticipantRole) {
-				fetchParticipantRow = true;
-			}
-		}
-		if (!labels.length && !fetchParticipantRow) {
-			return _perUserData(subj, rows, callback);
-		}
+		_applyAccessRows(subj, asUserId, res.rows1[1], res.rows2[1], _lookup, callback);
+	});
+
+	// Get the per-label access data
+	// Avoid making a join to allow more flexibility for sharding
+	Streams.Access.SELECT('*').where({
+		'publisherId': publisherIdForAccess,
+		'streamName': this.fields.name, // exact stream
+		'ofUserId': this.fields.name.substr(-1) === '/' ? asUserId : ['', asUserId]
+			// and either generic or specific user, if check template access use only specific
+	}).execute(p.fill('rows1'));
+
+	Streams.Access.SELECT('*').where({
+		'publisherId': ['', publisherIdForAccess],
+		'streamName': this.fields.type+"*",	// generic stream
+		'ofUserId': ['', asUserId]				// and specific user
+	}).execute(p.fill('rows2'));
+
+	function _lookup(labels, fetchParticipantRow, done) {
 		var p = new Q.Pipe(['contacts', 'participants'], function (res) {
-			if (res.contacts[0] || res.participants[0]) {
-				return callback.call(subj, err);
+			// This used to call back with an unrelated (always empty) variable,
+			// so a failed contacts or participant query read as success and the
+			// level computed so far was used. Report the real error (ro#1172).
+			var err = res.contacts[0] || res.participants[0];
+			if (err) {
+				return done(err);
 			}
-
-			var contacts = res.contacts[1];
-			var participants = res.participants[1];
-
-			// NOTE: we load arrays into memory and hope they are not too large
-			var i, j;
-			for (i=0; i<rows.length; ++i) {
-				var row = rows[i];
-				for (j=0; j<contacts.length; j++) {
-					if (row.fields.ofContactLabel === contacts[j].fields.label) {
-						_setStreamAccess(subj, rows[i], Streams.ACCESS_SOURCES['contact']);
-					}
-				}
-				var p = participants[0];
-				if (p && p.testRoles(row.fields.ofParticipantRole)) {
-					_setStreamAccess(subj, rows[i], Streams.ACCESS_SOURCES['participant']);
-				}
-			}
-			_perUserData(subj, rows, callback);
+			done(null, res.contacts[1], res.participants[1]);
 		});
 		if (labels.length > 0) {
 			Users.Contact.SELECT('*').where({
@@ -721,86 +684,405 @@ Sp.calculateAccess = function(asUserId, callback) {
 		} else {
 			p.fill('participants')(null, []);
 		}
-		function _setStreamAccess(stream, access, source) {
-			var readLevel =  stream.get('readLevel', 0);
-			var writeLevel = stream.get('writeLevel', 0);
-			var adminLevel = stream.get('adminLevel', 0);
-			if (access.fields.readLevel >= 0 && access.fields.readLevel > readLevel) {
-				stream.set('readLevel', access.fields.readLevel);
-				stream.set('readLevel_source', source);
+	}
+};
+
+/**
+ * Calculates access to a stream for many users at once, with a fixed number of
+ * queries however many users there are: two streams_access queries for all of
+ * them, plus one contacts query and at most one participants query when the
+ * access rows name contact labels or participant roles. The result for each
+ * user is exactly what stream.calculateAccess(userId) computes, but it is held
+ * on a separate per-user view of the stream, so the shared stream object is
+ * never modified and concurrent calculations cannot see each other's levels
+ * (ro#1172).
+ * @method calculateAccessForUsers
+ * @static
+ * @param {Streams_Stream} stream
+ * @param {Array} userIds
+ * @param {Object} [participants] Streams_Participant rows of this stream, by
+ *   userId, that are already in hand (notifyParticipants passes its batch).
+ *   Rows missing from it are queried when an access row needs them.
+ * @param {Function} callback Receives (err, views), where views[userId] is an
+ *   object that inherits from the stream, with its own get/set/clear and its
+ *   own publishedByFetcher, on which testReadLevel() etc. answer for that user.
+ */
+Streams_Stream.calculateAccessForUsers = function (stream, userIds, participants, callback) {
+	participants = participants || {};
+	var views = {};
+	var pending = [];
+	userIds.forEach(function (userId) {
+		var view = views[userId] = Streams_Stream.accessView(stream);
+		if (!_resetAccess(view, userId)) {
+			pending.push(userId);
+		}
+	});
+	if (!pending.length) {
+		return callback(null, views);
+	}
+	var publisherIdForAccess = _publisherIdForAccess(stream);
+	var isTemplate = stream.fields.name.substr(-1) === '/';
+	var p = new Q.Pipe(['rows1', 'rows2'], function (res) {
+		var err = res.rows1[0] || res.rows2[0];
+		if (err) {
+			return callback(err);
+		}
+		var rows1 = res.rows1[1];
+		var rows2 = res.rows2[1];
+		var requests = [];
+		var remaining = pending.length;
+		var failed = null;
+		pending.forEach(function (userId) {
+			// Each user sees exactly the rows its own calculateAccess queries
+			// would have returned, in the order the database returned them.
+			var r1 = rows1.filter(function (row) {
+				var of = row.fields.ofUserId;
+				return of === userId || (!isTemplate && of === '');
+			});
+			var r2 = rows2.filter(function (row) {
+				var of = row.fields.ofUserId;
+				return of === userId || of === '';
+			});
+			_applyAccessRows(views[userId], userId, r1, r2,
+			function (labels, fetchParticipantRow, done) {
+				requests.push({
+					userId: userId,
+					labels: labels,
+					fetchParticipantRow: fetchParticipantRow,
+					done: done
+				});
+			}, _finished);
+		});
+		if (requests.length) {
+			_lookupAll(requests);
+		}
+		function _finished(err) {
+			if (failed) {
+				return;
 			}
-			if (access.fields.writeLevel >= 0 && access.fields.writeLevel > writeLevel) {
-				stream.set('writeLevel', access.fields.writeLevel);
-				stream.set('writeLevel_source', source);
+			if (err) {
+				failed = err;
+				return callback(err);
 			}
-			if (access.fields.adminLevel >= 0 && access.fields.adminLevel > adminLevel) {
-				stream.set('adminLevel', access.fields.adminLevel);
-				stream.set('adminLevel_source', source);
+			if (--remaining === 0) {
+				callback(null, views);
 			}
-			var p1 = stream.get('permissions', []);
-			var p2 = access.getAllPermissions();
-			var p3 = [].concat(p1);
-			for (var k=0; k<p2.length; ++k) {
-				if (p3.indexOf(p2[k]) < 0) {
-					p3.push(p2[k]);
-				}
-			}
-			stream.set('permissions', p3);
-			stream.set('permissions_source', source);
-			 // NOTE: permissions are merged from more than one source
 		}
 	});
 
-	// For workspace publishers (e.g. "alice~ws1"), resolve access against
-	// the base publisher ("alice") so label/contact lookups work correctly.
-	var publisherIdForAccess = this.fields.publisherId;
-	var tildePos = publisherIdForAccess.indexOf('~');
-	if (tildePos !== -1) {
-		publisherIdForAccess = publisherIdForAccess.slice(0, tildePos);
-	}
-
-	// Get the per-label access data
-	// Avoid making a join to allow more flexibility for sharding
 	Streams.Access.SELECT('*').where({
 		'publisherId': publisherIdForAccess,
-		'streamName': this.fields.name, // exact stream
-		'ofUserId': this.fields.name.substr(-1) === '/' ? asUserId : ['', asUserId]
-			// and either generic or specific user, if check template access use only specific
+		'streamName': stream.fields.name, // exact stream
+		'ofUserId': isTemplate ? pending : [''].concat(pending)
 	}).execute(p.fill('rows1'));
 
 	Streams.Access.SELECT('*').where({
 		'publisherId': ['', publisherIdForAccess],
-		'streamName': this.fields.type+"*",	// generic stream
-		'ofUserId': ['', asUserId]				// and specific user
+		'streamName': stream.fields.type+"*",	// generic stream
+		'ofUserId': [''].concat(pending)
 	}).execute(p.fill('rows2'));
 
-	function _perUserData(subj, rows, callback) {
-		var row, i;
-		var direct_source = Streams.ACCESS_SOURCES['direct'];
-		for (i=0; i<rows.length; i++) {
-			row = rows[i];
-			if (row.fields.ofUserId === asUserId) {
-				if (row.fields.readLevel >= 0) {
-					subj.set('readLevel', row.fields.readLevel);
-					subj.set('readLevel_source', direct_source);
-				}
-				if (row.fields.writeLevel >= 0) {
-					subj.set('writeLevel', row.fields.writeLevel);
-					subj.set('writeLevel_source', direct_source);
-				}
-				if (row.fields.adminLevel >= 0) {
-					subj.set('adminLevel', row.fields.adminLevel);
-					subj.set('adminLevel_source', direct_source);
-				}
-				if (row.fields.permissions != null) {
-					subj.set('permissions', row.getAllPermissions());
-					subj.set('permissions_source', direct_source);
-				}
+	function _lookupAll(requests) {
+		var labels = [], contactUserIds = [], missing = [];
+		requests.forEach(function (r) {
+			if (r.labels.length) {
+				contactUserIds.push(r.userId);
+				r.labels.forEach(function (label) {
+					if (labels.indexOf(label) < 0) {
+						labels.push(label);
+					}
+				});
 			}
+			if (r.fetchParticipantRow && !participants[r.userId]) {
+				missing.push(r.userId);
+			}
+		});
+		var p = new Q.Pipe(['contacts', 'participants'], function (res) {
+			var err = res.contacts[0] || res.participants[0];
+			var contacts = res.contacts[1] || [];
+			var fetched = {};
+			(res.participants[1] || []).forEach(function (row) {
+				fetched[row.fields.userId] = row;
+			});
+			requests.forEach(function (r) {
+				if (err) {
+					return r.done(err);
+				}
+				var c = r.labels.length ? contacts.filter(function (contact) {
+					return contact.fields.contactUserId === r.userId
+						&& r.labels.indexOf(contact.fields.label) >= 0;
+				}) : [];
+				var row = r.fetchParticipantRow
+					&& (participants[r.userId] || fetched[r.userId]);
+				r.done(null, c, row ? [row] : []);
+			});
+		});
+		if (labels.length) {
+			Users.Contact.SELECT('*').where({
+				'userId':  stream.fields.publisherId,
+				'label': labels,
+				'contactUserId': contactUserIds
+			}).execute(p.fill('contacts'));
+		} else {
+			p.fill('contacts')(null, []);
 		}
-		callback.call(subj);
+		if (missing.length) {
+			Streams.Participant.SELECT('*').where({
+				'publisherId': stream.fields.publisherId,
+				'streamName': stream.fields.name,
+				'userId': missing
+			}).execute(p.fill('participants'));
+		} else {
+			p.fill('participants')(null, []);
+		}
 	}
 };
+
+/**
+ * A per-user view of a stream for access calculations: it inherits fields and
+ * methods from the stream, but has its own extra-data store (get/set/clear)
+ * and its own publishedByFetcher, so calculateAccess() and testReadLevel()
+ * called on it never touch the shared stream object (ro#1172).
+ * @method accessView
+ * @static
+ * @param {Streams_Stream} stream
+ * @return {Object}
+ */
+Streams_Stream.accessView = function (stream) {
+	var view = Object.create(stream);
+	var p = {};
+	view.set = function (key, value) {
+		p[key] = value;
+	};
+	view.get = function (key, def) {
+		if (key in p) return p[key];
+		else return def;
+	};
+	view.clear = function (key) {
+		if (key === undefined) p = {};
+		else delete p[key];
+	};
+	view.publishedByFetcher = false;
+	return view;
+};
+
+/**
+ * Batch of a stream's participants with userId after afterUserId, in userId
+ * order. Paging by key rather than by offset cannot skip or repeat anyone when
+ * rows are added or removed between batches.
+ * @method participantsAfter
+ * @static
+ * @param {Streams_Stream} stream
+ * @param {String|null} afterUserId null for the first batch
+ * @param {Number} limit
+ * @param {Function} callback Receives (err, rows)
+ */
+Streams_Stream.participantsAfter = function (stream, afterUserId, limit, callback) {
+	var criteria = {
+		publisherId: stream.fields.publisherId,
+		streamName: stream.fields.name
+	};
+	if (afterUserId != null) {
+		criteria.userId = new Db.Range(afterUserId, false, false, null);
+	}
+	Streams.Participant.SELECT('*').where(criteria)
+		.orderBy('userId', true)
+		.limit(limit)
+		.execute(callback);
+};
+
+// Resets the access levels held on subj to the stream's own fields, for
+// asUserId. Returns true when nothing more is needed: no user, or the user is
+// the publisher (who gets max access without any queries).
+function _resetAccess(subj, asUserId) {
+	var public_source = Streams.ACCESS_SOURCES['public'];
+	var direct_source = Streams.ACCESS_SOURCES['direct'];
+
+	subj.set('asUserId', asUserId);
+	subj.set('readLevel', subj.fields.readLevel);
+	subj.set('writeLevel', subj.fields.writeLevel);
+	subj.set('adminLevel', subj.fields.adminLevel);
+	subj.set('permissions', subj.getAllPermissions());
+	subj.set('readLevel_source', public_source);
+	subj.set('writeLevel_source', public_source);
+	subj.set('adminLevel_source', public_source);
+	subj.set('permissions_source', public_source);
+
+	if (!asUserId) {
+		return true;
+	}
+
+	// For workspace publishers (e.g. "alice~ws1"), resolve access against
+	// the base publisher ("alice") so the owner still gets full access to
+	// their own workspace streams, and label/contact lookups work correctly.
+	var publisherIdForAccess = _publisherIdForAccess(subj);
+
+	if (asUserId && asUserId === publisherIdForAccess) {
+		var required = Q.Config.get(['Streams', 'requiredUserStreams', subj.fields.name], false);
+		subj.set('isRequired', required);
+		subj.set('readLevel', Streams.READ_LEVEL['max']);
+		subj.set('writeLevel', Streams.WRITE_LEVEL['max']);
+		subj.set('adminLevel', Streams.ADMIN_LEVEL['max']);
+		subj.set('readLevel_source', direct_source);
+		subj.set('writeLevel_source', direct_source);
+		subj.set('adminLevel_source', direct_source);
+		subj.publishedByFetcher = true;
+		return true;
+	}
+	return false;
+}
+
+function _publisherIdForAccess(subj) {
+	var publisherIdForAccess = subj.fields.publisherId;
+	var tildePos = publisherIdForAccess.indexOf('~');
+	if (tildePos !== -1) {
+		publisherIdForAccess = publisherIdForAccess.slice(0, tildePos);
+	}
+	return publisherIdForAccess;
+}
+
+// Applies the streams_access rows for asUserId to subj: rows1 are the rows for
+// the exact stream name, rows2 those for the "<type>*" template. lookup(labels,
+// fetchParticipantRow, done) supplies the contacts and participant rows that
+// labelled or role-based rows need, as done(err, contacts, participants).
+// Calls callback.call(subj, err) exactly once.
+function _applyAccessRows(subj, asUserId, rows1, rows2, lookup, callback) {
+	var i, j, row;
+	for (i = 0; i < rows2.length; ++i) {
+		var access = rows2[i].fields;
+		if (
+			access.ofUserId === '' &&
+			!access.ofContactLabel &&
+			!access.ofParticipantRole
+		) {
+			var head = access.streamName.slice(0, -1);
+			if (subj.fields.type === head) {
+				_setStreamAccess(subj, rows2[i], Streams.ACCESS_SOURCES['public']);
+			}
+		}
+	}
+	// Apply universal access overrides for concrete (non-mutable) rules
+	for (i = 0; i < rows1.length; ++i) {
+		var access = rows1[i].fields;
+		if (
+			access.publisherId === '' &&
+			access.ofUserId === '' &&
+			!access.ofContactLabel &&
+			!access.ofParticipantRole
+		) {
+			// Concrete universal rule: matches this exact stream name
+			if (access.streamName === subj.fields.name) {
+				_setStreamAccess(subj, rows1[i], Streams.ACCESS_SOURCES['public']);
+			}
+		}
+	}
+	var rows = rows1.concat([]);
+	theloop:
+	for (i=0; i<rows2.length; ++i) {
+		var row2 = rows2[i];
+		for (j=0; j<rows1.length; ++j) {
+			var row1 = rows1[j];
+			if (row2.fields.streamName
+			=== row1.fields.streamName + '*') {
+				// skip the mutable access, because
+				// explicit stream access overrides it
+				continue theloop;
+			}
+		}
+		rows.push(row2);
+	}
+	var labels = [];
+	var fetchParticipantRow = false;
+	for (i=0; i<rows.length; i++) {
+		row = rows[i];
+		if (row.fields.ofContactLabel) {
+			labels.push(row.fields.ofContactLabel);
+		}
+		if (row.fields.ofParticipantRole) {
+			fetchParticipantRow = true;
+		}
+	}
+	if (!labels.length && !fetchParticipantRow) {
+		return _perUserData(subj, asUserId, rows, callback);
+	}
+	lookup(labels, fetchParticipantRow, function (err, contacts, participants) {
+		if (err) {
+			return callback.call(subj, err);
+		}
+
+		// NOTE: we load arrays into memory and hope they are not too large
+		var i, j;
+		for (i=0; i<rows.length; ++i) {
+			var row = rows[i];
+			for (j=0; j<contacts.length; j++) {
+				if (row.fields.ofContactLabel === contacts[j].fields.label) {
+					_setStreamAccess(subj, rows[i], Streams.ACCESS_SOURCES['contact']);
+				}
+			}
+			var p = participants[0];
+			if (p && p.testRoles(row.fields.ofParticipantRole)) {
+				_setStreamAccess(subj, rows[i], Streams.ACCESS_SOURCES['participant']);
+			}
+		}
+		_perUserData(subj, asUserId, rows, callback);
+	});
+}
+
+function _setStreamAccess(stream, access, source) {
+	var readLevel =  stream.get('readLevel', 0);
+	var writeLevel = stream.get('writeLevel', 0);
+	var adminLevel = stream.get('adminLevel', 0);
+	if (access.fields.readLevel >= 0 && access.fields.readLevel > readLevel) {
+		stream.set('readLevel', access.fields.readLevel);
+		stream.set('readLevel_source', source);
+	}
+	if (access.fields.writeLevel >= 0 && access.fields.writeLevel > writeLevel) {
+		stream.set('writeLevel', access.fields.writeLevel);
+		stream.set('writeLevel_source', source);
+	}
+	if (access.fields.adminLevel >= 0 && access.fields.adminLevel > adminLevel) {
+		stream.set('adminLevel', access.fields.adminLevel);
+		stream.set('adminLevel_source', source);
+	}
+	var p1 = stream.get('permissions', []);
+	var p2 = access.getAllPermissions();
+	var p3 = [].concat(p1);
+	for (var k=0; k<p2.length; ++k) {
+		if (p3.indexOf(p2[k]) < 0) {
+			p3.push(p2[k]);
+		}
+	}
+	stream.set('permissions', p3);
+	stream.set('permissions_source', source);
+	 // NOTE: permissions are merged from more than one source
+}
+
+function _perUserData(subj, asUserId, rows, callback) {
+	var row, i;
+	var direct_source = Streams.ACCESS_SOURCES['direct'];
+	for (i=0; i<rows.length; i++) {
+		row = rows[i];
+		if (row.fields.ofUserId === asUserId) {
+			if (row.fields.readLevel >= 0) {
+				subj.set('readLevel', row.fields.readLevel);
+				subj.set('readLevel_source', direct_source);
+			}
+			if (row.fields.writeLevel >= 0) {
+				subj.set('writeLevel', row.fields.writeLevel);
+				subj.set('writeLevel_source', direct_source);
+			}
+			if (row.fields.adminLevel >= 0) {
+				subj.set('adminLevel', row.fields.adminLevel);
+				subj.set('adminLevel_source', direct_source);
+			}
+			if (row.fields.permissions != null) {
+				subj.set('permissions', row.getAllPermissions());
+				subj.set('permissions_source', direct_source);
+			}
+		}
+	}
+	callback.call(subj);
+}
 
 /**
  * Inherits access from any streams specified in the inheritAccess field.
@@ -1437,10 +1719,13 @@ Sp.unsubscribe = function(options, callback) {
  * @param {String} event The type of Streams event, such as "post" or "remove"
  * @param {Streams_Message|Steams_Ephemeral} messageOrEphemeral pass a message with instructions or ephemeral with payload
  * @param {Function} [callback] This would be called after all the notifying was done
+ * @param {Object} [accessView] The participant's access, already calculated by
+ *   Streams.Stream.calculateAccessForUsers(). Otherwise it is calculated here.
  */
-Sp.notify = function(participant, event, messageOrEphemeral, callback) {
+Sp.notify = function(participant, event, messageOrEphemeral, callback, accessView) {
 	var stream = this;
 	var userId = participant.fields.userId;
+	var _finish = callback || function () {};
 	function _notify(err, access) {
 		if (err) {
 		    return callback && callback(err);
@@ -1503,18 +1788,28 @@ Sp.notify = function(participant, event, messageOrEphemeral, callback) {
 				return false;
 			}
 
-			Streams.Subscription.test(userId, stream, messageOrEphemeral.getType(), _continue2);
+			// The offline path costs several queries, an avatar fetch and a
+			// rendered delivery per participant. Run it through a process-wide
+			// limit so a post to a large stream, or many posts at once, queue
+			// small closures here instead of all doing that work at once (ro#1172).
+			_offlineSlot(function (release) {
+				_finish = function () {
+					release();
+					callback && callback.apply(this, arguments);
+				};
+				Streams.Subscription.test(userId, stream, messageOrEphemeral.getType(), _continue2);
+			});
 		}
 		function _continue2(err, deliveries) {
 			var message = messageOrEphemeral;
 			if (err || !deliveries.length) {
-				return callback && callback(err);
+				return _finish(err);
 			}
 			var waitingFor = deliveries.map(function(d) { return JSON.stringify(d); });
 			var p = new Q.Pipe(waitingFor, function(params) {
 				for (var d in params) {
 					if (params[d][0]) {
-						return callback && callback(params[d][0]);
+						return _finish(params[d][0]);
 					}
 				}
 				new Streams.Notification({
@@ -1524,7 +1819,7 @@ Sp.notify = function(participant, event, messageOrEphemeral, callback) {
 					messageOrdinal: message.fields.ordinal,
 					type: message.fields.type
 				}).save(function(err) {
-					callback && callback(err, deliveries);
+					_finish(err, deliveries);
 				});
 			});
 			// actually notify according to the deliveriy rules
@@ -1623,14 +1918,20 @@ Sp.notify = function(participant, event, messageOrEphemeral, callback) {
 		t === 'Streams/left' ||
 		t === 'Streams/joined'
 	) ? 'participants' : 'messages';
-	if (this.get('asUserId') !== userId) {
-		this.calculateAccess(userId, function (err) {
-			if (err) return callback && callback(err);
-			this.testReadLevel(Streams.READ_LEVEL[readLevel], _notify);
-		});
-	} else {
-		this.testReadLevel(Streams.READ_LEVEL[readLevel], _notify);
+	// Access is decided on a per-participant view, never on the shared stream
+	// (ro#1172). This used to call this.calculateAccess(userId) on the stream
+	// itself, and notifyParticipants ran it for every participant at once on
+	// the same object: each call reset the levels while others' queries were
+	// still in flight, _setStreamAccess only ever raises a level, and the
+	// publisher's turn set publishedByFetcher for good — so one participant's
+	// access could be read as another's.
+	if (accessView && accessView.get('asUserId') === userId) {
+		return accessView.testReadLevel(Streams.READ_LEVEL[readLevel], _notify);
 	}
+	Streams_Stream.accessView(this).calculateAccess(userId, function (err) {
+		if (err) return callback && callback(err);
+		this.testReadLevel(Streams.READ_LEVEL[readLevel], _notify);
+	});
 };
 
 /**
@@ -1951,5 +2252,57 @@ Streams_Stream.describeError = function Streams_Stream_describeError(err) {
 		return String(err);
 	}
 };
+
+// Process-wide limit on offline notification work in flight (ro#1172).
+// Streams/notifications/offlineConcurrency (default 10) slots; the rest wait
+// in a queue of closures. A slot is released when the participant's offline
+// notification finishes, or after Streams/notifications/offlineTimeout
+// seconds (default 60) so a delivery that never calls back cannot stall
+// every later notification.
+var _offline = { active: 0, queue: [] };
+
+function _offlineSlot(task) {
+	_offline.queue.push(task);
+	_offlineNext();
+}
+
+function _offlineNext() {
+	var max = parseInt(Q.Config.get(['Streams', 'notifications', 'offlineConcurrency'], 10));
+	if (!(max > 0)) {
+		max = 10;
+	}
+	while (_offline.active < max && _offline.queue.length) {
+		_offlineRun(_offline.queue.shift());
+	}
+}
+
+function _offlineRun(task) {
+	var released = false;
+	var seconds = Q.Config.get(['Streams', 'notifications', 'offlineTimeout'], 60);
+	var timer = setTimeout(function () {
+		Q.log("Streams.Stream.notify: an offline notification was still running after "
+			+ seconds + "s; releasing its slot");
+		release();
+	}, seconds * 1000);
+	_offline.active++;
+	function release() {
+		if (released) {
+			return;
+		}
+		released = true;
+		clearTimeout(timer);
+		_offline.active--;
+		// Not synchronously: a task that finishes at once must not recurse
+		// through the whole queue on one stack.
+		setImmediate(_offlineNext);
+	}
+	try {
+		task(release);
+	} catch (e) {
+		Q.log("Streams.Stream.notify: offline notification threw: "
+			+ Streams_Stream.describeError(e));
+		release();
+	}
+}
 
 module.exports = Streams_Stream;
