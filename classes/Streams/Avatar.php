@@ -60,6 +60,7 @@ class Streams_Avatar extends Base_Streams_Avatar
 				$avatars[$r->publisherId] = $r;
 			}
 		}
+		self::afterFetch($toUserId, $avatars, 'fetch');
 		return $return_one
 			? ($avatars ? reset($avatars) : null)
 			: $avatars;
@@ -170,7 +171,47 @@ class Streams_Avatar extends Base_Streams_Avatar
 		if ($handlersCalled) {
 			$avatars = Q::take($avatars, $userIds);
 		}
+		self::afterFetch(
+			is_array($toUserId) ? reset($toUserId) : $toUserId,
+			$avatars, 'fetchByPrefix'
+		);
 		return $avatars;
+	}
+
+	/**
+	 * Lets an app shape the avatars a viewer receives, at the one place every
+	 * name display reads them from: the Users/avatar tool, Streams::displayName()
+	 * (page titles, og:title, notifications), the Streams/avatar action and
+	 * preloaded avatars all come through fetch() or fetchByPrefix().
+	 *
+	 * Rows are precomputed per (toUserId, publisherId) from each name stream's
+	 * readLevel and access rows, so "what this viewer may see" can only be
+	 * expressed in the table as one row per viewer. A display policy that
+	 * depends on who the viewer is in some other sense -- e.g. a member of the
+	 * same community -- has nowhere to live without this hook.
+	 *
+	 * Handlers receive the Streams_Avatar objects and may modify their fields
+	 * in place. They must not save them: a modified row is a per-viewer view,
+	 * not the stored avatar.
+	 * @method afterFetch
+	 * @static
+	 * @protected
+	 * @param {string} $toUserId the viewer ("" for a caller with no session)
+	 * @param {array} $avatars Streams_Avatar rows indexed by publisherId
+	 * @param {string} $from "fetch" or "fetchByPrefix"
+	 */
+	protected static function afterFetch($toUserId, $avatars, $from)
+	{
+		if (!$avatars) {
+			return;
+		}
+		/**
+		 * @event Streams/Avatar/fetch {after}
+		 * @param {string} toUserId
+		 * @param {array} avatars
+		 * @param {string} from
+		 */
+		Q::event('Streams/Avatar/fetch', @compact('toUserId', 'avatars', 'from'), 'after');
 	}
 	
 	/**
