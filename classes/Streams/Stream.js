@@ -527,9 +527,12 @@ Sp.notifyParticipants = function (event, messageOrEphemeral, dontNotifyObservers
 
 	function _notifyOne(participants, userId, view) {
 		var participant = participants[userId];
+		// The completion closure below can sit in the offline queue for a
+		// while; it holds the batch's rows only when a caller asked for them.
+		var batch = callback ? participants : null;
 		try {
 			stream.notify(participant, event, messageOrEphemeral, function (err) {
-				callback && callback(err, participants);
+				callback && callback(err, batch);
 				if (!err) return;
 				// Always log. This used to be gated behind the
 				// Streams/notifications/debug config, which defaults to false, so
@@ -1725,7 +1728,6 @@ Sp.unsubscribe = function(options, callback) {
 Sp.notify = function(participant, event, messageOrEphemeral, callback, accessView) {
 	var stream = this;
 	var userId = participant.fields.userId;
-	var _finish = callback || function () {};
 	function _notify(err, access) {
 		if (err) {
 		    return callback && callback(err);
@@ -1789,100 +1791,12 @@ Sp.notify = function(participant, event, messageOrEphemeral, callback, accessVie
 			}
 
 			// The offline path costs several queries, an avatar fetch and a
-			// rendered delivery per participant. Run it through a process-wide
-			// limit so a post to a large stream, or many posts at once, queue
-			// small closures here instead of all doing that work at once (ro#1172).
-			_offlineSlot(function (release) {
-				_finish = function () {
-					release();
-					callback && callback.apply(this, arguments);
-				};
-				Streams.Subscription.test(userId, stream, messageOrEphemeral.getType(), _continue2);
-			});
-		}
-		function _continue2(err, deliveries) {
-			var message = messageOrEphemeral;
-			if (err || !deliveries.length) {
-				return _finish(err);
-			}
-			var waitingFor = deliveries.map(function(d) { return JSON.stringify(d); });
-			var p = new Q.Pipe(waitingFor, function(params) {
-				for (var d in params) {
-					if (params[d][0]) {
-						return _finish(params[d][0]);
-					}
-				}
-				new Streams.Notification({
-					userId: userId,
-					publisherId: participant.fields.publisherId,
-					streamName: participant.fields.streamName,
-					messageOrdinal: message.fields.ordinal,
-					type: message.fields.type
-				}).save(function(err) {
-					_finish(err, deliveries);
-				});
-			});
-			// actually notify according to the deliveriy rules
-			var byUserId = message.fields.byUserId;
-			Streams.Avatar.fetch(userId, byUserId, function (err, avatar) {
-				var logfile = Q.Config.get(
-					['Streams', 'types', '*', 'messages', '*', 'log'],
-					false
-				);
-				if (logfile) {
-					Q.log({
-						messageType: message.fields.type,
-						publisherId: stream.fields.publisherId,
-						streamName: stream.fields.name,
-						deliveries: deliveries,
-						displayName: avatar && avatar.displayName()
-					}, logfile);
-				}
-				if (message.fields.type !== "Streams/invited") {
-					return deliveries.forEach(function(delivery) {
-						message.deliver(stream, userId, delivery, avatar,
-							p.fill(JSON.stringify(delivery))
-						);
-					});
-				}
-				// This is only for "Streams/invited"
-				var instructions = JSON.parse(message.fields.instructions);
-				new Streams.Invite({
-					token: instructions.token
-				}).retrieve(function(err, rows) {
-					if (err || !rows.length) {
-						return deliveries.forEach(function(delivery) {
-							p.fill(JSON.stringify(delivery))(err); 
-						});
-					}
-					var invite = this;
-					new Streams.Stream({
-						publisherId: invite.fields.publisherId,
-						name: invite.fields.streamName
-					}).retrieve(function(err, rows2) {
-						if (err || !rows2.length) {
-							return deliveries.forEach(function(delivery) {
-								p.fill(JSON.stringify(delivery))(err); 
-							});
-						}
-						var stream = this;
-						try { 
-							var instructions = JSON.parse(message.fields.instructions); 
-						} catch (e) {}
-						var invited = invite.getFields();
-						invited.url = invite.url();
-						if (instructions && instructions.type) {
-							invited[instructions.type] = true;
-						}
-						stream.invited = invited;
-						deliveries.forEach(function(delivery) {
-							message.deliver(stream, userId, delivery, avatar,
-								p.fill(JSON.stringify(delivery))
-							);
-						});
-					});
-				});
-			});
+			// rendered delivery per participant. It runs through a process-wide
+			// limit, from a module-level function so that a queued task holds
+			// only a few strings and the shared stream and message, not this
+			// participant's row and closures (ro#1172).
+			_offlineNotify(stream, messageOrEphemeral, userId,
+				participant.fields.publisherId, participant.fields.streamName, callback);
 		}
 		
 		function _devices() {
@@ -2252,6 +2166,108 @@ Streams_Stream.describeError = function Streams_Stream_describeError(err) {
 		return String(err);
 	}
 };
+
+// Offline notification for one participant who may read the message, has no
+// client online and is subscribed: subscription rules, avatar, deliveries and
+// the Streams_Notification row. Queued through _offlineSlot (ro#1172); kept at
+// module level so a queued task retains only its arguments.
+function _offlineNotify(stream, messageOrEphemeral, userId,
+	participantPublisherId, participantStreamName, callback
+) {
+	var _finish;
+	_offlineSlot(function (release) {
+		_finish = function () {
+			release();
+			callback && callback.apply(this, arguments);
+		};
+		Streams.Subscription.test(userId, stream, messageOrEphemeral.getType(), _continue2);
+	});
+	function _continue2(err, deliveries) {
+		var message = messageOrEphemeral;
+		if (err || !deliveries.length) {
+			return _finish(err);
+		}
+		var waitingFor = deliveries.map(function(d) { return JSON.stringify(d); });
+		var p = new Q.Pipe(waitingFor, function(params) {
+			for (var d in params) {
+				if (params[d][0]) {
+					return _finish(params[d][0]);
+				}
+			}
+			new Streams.Notification({
+				userId: userId,
+				publisherId: participantPublisherId,
+				streamName: participantStreamName,
+				messageOrdinal: message.fields.ordinal,
+				type: message.fields.type
+			}).save(function(err) {
+				_finish(err, deliveries);
+			});
+		});
+		// actually notify according to the deliveriy rules
+		var byUserId = message.fields.byUserId;
+		Streams.Avatar.fetch(userId, byUserId, function (err, avatar) {
+			var logfile = Q.Config.get(
+				['Streams', 'types', '*', 'messages', '*', 'log'],
+				false
+			);
+			if (logfile) {
+				Q.log({
+					messageType: message.fields.type,
+					publisherId: stream.fields.publisherId,
+					streamName: stream.fields.name,
+					deliveries: deliveries,
+					displayName: avatar && avatar.displayName()
+				}, logfile);
+			}
+			if (message.fields.type !== "Streams/invited") {
+				return deliveries.forEach(function(delivery) {
+					message.deliver(stream, userId, delivery, avatar,
+						p.fill(JSON.stringify(delivery))
+					);
+				});
+			}
+			// This is only for "Streams/invited"
+			var instructions = JSON.parse(message.fields.instructions);
+			new Streams.Invite({
+				token: instructions.token
+			}).retrieve(function(err, rows) {
+				if (err || !rows.length) {
+					return deliveries.forEach(function(delivery) {
+						p.fill(JSON.stringify(delivery))(err); 
+					});
+				}
+				var invite = this;
+				new Streams.Stream({
+					publisherId: invite.fields.publisherId,
+					name: invite.fields.streamName
+				}).retrieve(function(err, rows2) {
+					if (err || !rows2.length) {
+						return deliveries.forEach(function(delivery) {
+							p.fill(JSON.stringify(delivery))(err); 
+						});
+					}
+					var stream = this;
+					try { 
+						var instructions = JSON.parse(message.fields.instructions); 
+					} catch (e) {}
+					var invited = invite.getFields();
+					invited.url = invite.url();
+					if (instructions && instructions.type) {
+						invited[instructions.type] = true;
+					}
+					stream.invited = invited;
+					deliveries.forEach(function(delivery) {
+						message.deliver(stream, userId, delivery, avatar,
+							p.fill(JSON.stringify(delivery))
+						);
+					});
+				});
+			});
+		});
+	}
+	
+}
 
 // Process-wide limit on offline notification work in flight (ro#1172).
 // Streams/notifications/offlineConcurrency (default 10) slots; the rest wait
