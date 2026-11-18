@@ -1250,7 +1250,14 @@ Streams.fetchOne = function (asUserId, publisherId, streamName, callback, fields
 		if (!res.length) {
 		    return callback(null, null);
 		}
-		res[0].calculateAccess(asUserId, function () {
+		res[0].calculateAccess(asUserId, function (err) {
+			// A failed access query used to be ignored here, handing back the
+			// stream with whatever levels were set before it failed (its public
+			// levels), which inheritAccess then trusted: fail open. Report it
+			// (ro#1172 audit, R04).
+			if (err) {
+				return callback.call(res[0], err);
+			}
 		    callback.call(res[0], null, res[0]);
 		});
 	});
