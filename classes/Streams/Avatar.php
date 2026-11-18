@@ -180,9 +180,12 @@ class Streams_Avatar extends Base_Streams_Avatar
 
 	/**
 	 * Lets an app shape the avatars a viewer receives, at the one place every
-	 * name display reads them from: the Users/avatar tool, Streams::displayName()
-	 * (page titles, og:title, notifications), the Streams/avatar action and
-	 * preloaded avatars all come through fetch() or fetchByPrefix().
+	 * PHP name display reads them from: the Users/avatar tool,
+	 * Streams::displayName() (page titles, og:title, PHP-rendered text), the
+	 * Streams/avatar action and preloaded avatars all come through fetch() or
+	 * fetchByPrefix(). NOT covered: Node (Streams/classes/Streams/Avatar.js)
+	 * selects streams_avatar itself for notification texts, and this PHP event
+	 * never runs there.
 	 *
 	 * Rows are precomputed per (toUserId, publisherId) from each name stream's
 	 * readLevel and access rows, so "what this viewer may see" can only be

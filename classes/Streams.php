@@ -2080,7 +2080,7 @@ abstract class Streams extends Base_Streams
 	 *   @param {boolean} [$options.show] The parts of the name to show. Can have the letters "f", "l", "u" in any order.
 	 *   @param {boolean} [$options.html] If true, encloses the first name, last name, username in span tags. If an array, then it will be used as the attributes of the html.
 	 *   @param {boolean} [$options.escape] If true, does HTML escaping of the retrieved field
-	 *   @param {string} [$options.asUserId=Users::loggedInUser()] Optionally override which user to get the display name as
+	 *   @param {string} [$options.asUserId=Users::loggedInUser()] Optionally override which user to get the display name as. Pass "" for the public view.
 	 *   @param {string} [$options.fullAccess=false] if true, sets the $asUserId = $userId
 	 *   @param {array|string} [$options.fallback] HTML to return if there is no info to get displayName from.
 	 *     You can set it to an array of (textName, pathArray) to be used with Q::interpolate(),
@@ -2092,7 +2092,11 @@ abstract class Streams extends Base_Streams
 		if ($userId instanceof Users_User) {
 			$userId = $userId->id;
 		}
-		if (!empty($options['asUserId'])) {
+		// isset, not !empty: asUserId "" means "as the public" (the profile
+		// stream's title is computed that way). !empty() treated it as unset
+		// and evaluated as the logged-in user -- usually the owner, whose own
+		// avatar carries their full name -- so that public title stored it.
+		if (isset($options['asUserId'])) {
 			$asUserId = $options['asUserId'];
 		} else if (!empty($options['fullAccess'])) {
 			$asUserId = $userId;
@@ -3128,6 +3132,7 @@ abstract class Streams extends Base_Streams
 			$isCategory = true;
 		}
 		$skipTypes = Q::ifset($options, 'skipTypes', array());
+		$skipParticipating = array();
 
 		$workspaces = Streams_Workspace::fromRequest($options);
 		$workspacePublisherIds = Streams_Workspace::stackedPublisherIds($publisherId, $workspaces);
@@ -3148,6 +3153,16 @@ abstract class Streams extends Base_Streams
 				}
 				if (!$row->testReadLevel('participants')) {
 					$skipTypes[$n][] = 'Streams/participating';
+					// Streams::join() relates the joined stream to each of the
+					// joiner's own "participating" categories with the STREAM
+					// TYPE as the relation type, so the skipTypes entry above
+					// never matches those relations. Seen from the stream
+					// (isCategory false), each one names a participant in
+					// toPublisherId: hide them by category name instead.
+					$skipParticipating[$n] = array_merge(
+						array('Streams/participating'),
+						(array)Streams_Stream::getConfigField($row->type, 'participating', array())
+					);
 				}
 				$streams[$n] = $row;
 			}
@@ -3407,6 +3422,12 @@ abstract class Streams extends Base_Streams
 				}
 			}
 			if (!empty($skipTypes[$v->$col2]) && in_array($v->type, $skipTypes[$v->$col2])) {
+				unset($relations[$k]);
+				continue;
+			}
+			if (!$isCategory
+			and !empty($skipParticipating[$v->$col2])
+			and in_array($v->$col, $skipParticipating[$v->$col2], true)) {
 				unset($relations[$k]);
 			}
 		}
