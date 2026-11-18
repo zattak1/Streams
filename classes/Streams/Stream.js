@@ -536,40 +536,49 @@ Sp.notifyParticipants = function (event, messageOrEphemeral, dontNotifyObservers
 	}
 
 	function _notifyOne(participants, userId, view) {
+		// The completion closure can sit in the offline queue for a while, so
+		// it is made by _completion(), whose scope holds only the userId and,
+		// when a caller asked for them, the batch's rows. Creating it in this
+		// scope would keep this participant's row and access view alive with
+		// it (measured: +100 MiB at the #1143 ramp).
+		var done = _completion(userId, callback ? participants : null);
 		var participant = participants[userId];
-		// The completion closure below can sit in the offline queue for a
-		// while; it holds the batch's rows only when a caller asked for them.
-		var batch = callback ? participants : null;
 		var level;
 		try {
 			level = _readLevelFor(messageOrEphemeral);
 		} catch (e) {
 			// e.g. Streams/Stream/remove passes a null message: let notify()
-			// throw and be logged below, as before.
-			return _dispatch();
+			// throw and be logged, as before.
+			return _send(participant, userId, view, null, done);
 		}
 		// Most participants are decided synchronously from the batch's rows.
 		// Those whose access depends on inheritAccess go through a bounded
 		// slot, since each costs a fetchOne per inherited stream (R03).
 		_decideRead(view, level, function (err, allowed) {
-			_dispatch({ err: err, allowed: allowed });
+			_send(participant, userId, view, { err: err, allowed: allowed }, done);
 		});
-		function _dispatch(decision) {
+	}
+
+	function _completion(userId, batch) {
+		return function (err) {
+			callback && callback(err, batch);
+			if (!err) return;
+			// Always log. This used to be gated behind the
+			// Streams/notifications/debug config, which defaults to false, so
+			// socket delivery failed completely silently in production and read
+			// as "flaky realtime" rather than as a dead DB connection.
+			Q.log("Streams.Stream.notifyParticipants: failed to notify user '"
+				+ userId + "' of event '" + event + "' on stream " + streamId
+				+ ": " + Streams_Stream.describeError(err));
+			if (Q.Config.get(["Streams", "notifications", "debug"], false)) {
+				Q.log(err);
+			}
+		};
+	}
+
+	function _send(participant, userId, view, decision, done) {
 		try {
-			stream.notify(participant, event, messageOrEphemeral, function (err) {
-				callback && callback(err, batch);
-				if (!err) return;
-				// Always log. This used to be gated behind the
-				// Streams/notifications/debug config, which defaults to false, so
-				// socket delivery failed completely silently in production and read
-				// as "flaky realtime" rather than as a dead DB connection.
-				Q.log("Streams.Stream.notifyParticipants: failed to notify user '"
-					+ userId + "' of event '" + event + "' on stream " + streamId
-					+ ": " + Streams_Stream.describeError(err));
-				if (Q.Config.get(["Streams", "notifications", "debug"], false)) {
-					Q.log(err);
-				}
-			}, view, decision);
+			stream.notify(participant, event, messageOrEphemeral, done, view, decision);
 		} catch (e) {
 			// notify() can also throw synchronously — e.g. it calls
 			// messageOrEphemeral.getType(), and Streams/Stream/remove passes null.
@@ -577,7 +586,6 @@ Sp.notifyParticipants = function (event, messageOrEphemeral, dontNotifyObservers
 			Q.log("Streams.Stream.notifyParticipants: notify() threw for user '"
 				+ userId + "', event '" + event + "' on stream " + streamId
 				+ ": " + Streams_Stream.describeError(e));
-		}
 		}
 	}
 	return true;
