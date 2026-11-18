@@ -463,8 +463,11 @@ Sp.notifyParticipants = function (event, messageOrEphemeral, dontNotifyObservers
 	// access queries (three with contact labels) whatever its size; the next
 	// batch is fetched only after this one's access is computed, so a post
 	// holds at most one batch of rows at a time however large the stream is.
-	// Offline notifications to subscribed participants still cost queries
-	// each; notify() runs those through a process-wide limit (_offlineSlot).
+	// Two kinds of work still cost queries per participant, and each runs
+	// through its own process-wide limit: offline notifications to subscribed
+	// participants (_offlineSlot), and access that depends on inheritAccess,
+	// which fetches each inherited stream as the participant (_decideRead).
+	// Observers get the same per-user treatment in notifyObservers.
 	var batchSize = parseInt(Q.Config.get(['Streams', 'notifications', 'batchSize'], 100));
 	if (!(batchSize > 0)) {
 		batchSize = 100;
@@ -498,8 +501,8 @@ Sp.notifyParticipants = function (event, messageOrEphemeral, dontNotifyObservers
 				participants[rows[i].fields.userId] = rows[i];
 			}
 			var userIds = Object.keys(participants);
-			// Observers are told once, as soon as the first batch was read, as
-			// before; their access was checked when they started observing.
+			// Observers are told once, as soon as the first batch was read.
+			// notifyObservers decides each observer's access on its own view.
 			if (!dontNotifyObservers && !notifiedObservers) {
 				notifiedObservers = true;
 				stream.notifyObservers(event, messageOrEphemeral);
@@ -509,15 +512,22 @@ Sp.notifyParticipants = function (event, messageOrEphemeral, dontNotifyObservers
 				if (err) {
 					// Fail closed: without a computed access level nobody in this
 					// batch may receive the event.
+					// Only this batch is skipped: the paging cursor does not depend
+					// on the access result, so later batches are still delivered
+					// (ro#1172 audit, R05: one transient error used to drop
+					// everyone after it in userId order).
 					Q.log("Streams.Stream.notifyParticipants: cannot calculate access for stream "
-						+ streamId + ", event '" + event + "' NOT delivered to "
-						+ userIds.length + " participant(s): "
+						+ streamId + ", event '" + event + "' NOT delivered to the "
+						+ userIds.length + " participant(s) of this batch"
+						+ (afterUserId ? " (after '" + afterUserId + "')" : "")
+						+ "; continuing with the next batch: "
 						+ Streams_Stream.describeError(err));
-					return callback && callback(err, participants);
+					callback && callback(err, participants);
+				} else {
+					userIds.forEach(function (userId) {
+						_notifyOne(participants, userId, views[userId]);
+					});
 				}
-				userIds.forEach(function (userId) {
-					_notifyOne(participants, userId, views[userId]);
-				});
 				if (rows.length >= batchSize) {
 					_batch(rows[rows.length - 1].fields.userId);
 				}
@@ -530,6 +540,21 @@ Sp.notifyParticipants = function (event, messageOrEphemeral, dontNotifyObservers
 		// The completion closure below can sit in the offline queue for a
 		// while; it holds the batch's rows only when a caller asked for them.
 		var batch = callback ? participants : null;
+		var level;
+		try {
+			level = _readLevelFor(messageOrEphemeral);
+		} catch (e) {
+			// e.g. Streams/Stream/remove passes a null message: let notify()
+			// throw and be logged below, as before.
+			return _dispatch();
+		}
+		// Most participants are decided synchronously from the batch's rows.
+		// Those whose access depends on inheritAccess go through a bounded
+		// slot, since each costs a fetchOne per inherited stream (R03).
+		_decideRead(view, level, function (err, allowed) {
+			_dispatch({ err: err, allowed: allowed });
+		});
+		function _dispatch(decision) {
 		try {
 			stream.notify(participant, event, messageOrEphemeral, function (err) {
 				callback && callback(err, batch);
@@ -544,7 +569,7 @@ Sp.notifyParticipants = function (event, messageOrEphemeral, dontNotifyObservers
 				if (Q.Config.get(["Streams", "notifications", "debug"], false)) {
 					Q.log(err);
 				}
-			}, view);
+			}, view, decision);
 		} catch (e) {
 			// notify() can also throw synchronously — e.g. it calls
 			// messageOrEphemeral.getType(), and Streams/Stream/remove passes null.
@@ -552,6 +577,7 @@ Sp.notifyParticipants = function (event, messageOrEphemeral, dontNotifyObservers
 			Q.log("Streams.Stream.notifyParticipants: notify() threw for user '"
 				+ userId + "', event '" + event + "' on stream " + streamId
 				+ ": " + Streams_Stream.describeError(e));
+		}
 		}
 	}
 	return true;
@@ -567,35 +593,79 @@ Sp.notifyParticipants = function (event, messageOrEphemeral, dontNotifyObservers
  */
 Sp.notifyObservers = function (event, messageOrEphemeral) {
 	var stream = this;
-	var fields = this.fields;
 	var streamId = Streams_Stream.logId(this);
-	this.getObservers(function (err, observers) {
-		// Same anti-pattern as notifyParticipants above, with the opposite symptom:
-		// `for (var x in undefined)` iterates zero times rather than throwing, so an
-		// access failure here dropped every observer's copy of the event with no
-		// trace in any log. Report it instead.
+	// Each observer's access is decided per post on its own view of the stream,
+	// batched like the participants' (ro#1172 audit, R01). This used to call
+	// getObservers(), whose testReadLevel('messages') read the *shared* stream:
+	// it passed only by accident, because the old per-participant
+	// calculateAccess() calls had just written their levels onto that object.
+	// Observers without a user (logged-out sockets) get what
+	// calculateAccess('') gives: the stream's own public levels, the same rule
+	// the Streams/observe handler applied when they started observing.
+	var observers = Q.getObject(
+		[stream.fields.publisherId, stream.fields.name],
+		Streams.observers
+	) || {};
+	var byUser = {};
+	Object.keys(observers).forEach(function (clientId) {
+		var client = observers[clientId];
+		var userId = (client && client.capability && client.capability.userId) || '';
+		(byUser[userId] = byUser[userId] || []).push(clientId);
+	});
+	var userIds = Object.keys(byUser);
+	if (!userIds.length) {
+		return;
+	}
+	var level;
+	try {
+		level = _readLevelFor(messageOrEphemeral);
+	} catch (e) {
+		level = Streams.READ_LEVEL['messages'];
+	}
+	Streams_Stream.calculateAccessForUsers(stream, userIds.filter(function (u) {
+		return u !== '';
+	}), null, function (err, views) {
 		if (err) {
-			Q.log("Streams.Stream.notifyObservers: cannot get observers for stream "
-				+ streamId + ", event '" + event + "' NOT delivered to observers: "
+			Q.log("Streams.Stream.notifyObservers: cannot calculate access for stream "
+				+ streamId + ", event '" + event + "' NOT delivered to "
+				+ Object.keys(observers).length + " observer(s): "
 				+ Streams_Stream.describeError(err));
 			return;
 		}
-		for (var clientId in observers) {
-			try {
-				observers[clientId].emit(event, messageOrEphemeral.getFields(), {
-					publisherId: stream.fields.publisherId,
-					streamName: stream.fields.name,
-					streamType: stream.fields.type,
-					messageCount: stream.fields.messageCount
-				});
-			} catch (e) {
-				// One dead socket must not abort the fan-out to the others,
-				// nor take the process down from inside an async callback.
-				Q.log("Streams.Stream.notifyObservers: emit failed for client '"
-					+ clientId + "', event '" + event + "' on stream " + streamId
-					+ ": " + Streams_Stream.describeError(e));
-			}
+		if (byUser['']) {
+			views[''] = Streams_Stream.accessView(stream);
+			_resetAccess(views[''], '');
 		}
+		userIds.forEach(function (userId) {
+			_decideRead(views[userId], level, function (err, allowed) {
+				if (err) {
+					Q.log("Streams.Stream.notifyObservers: cannot decide access of user '"
+						+ userId + "' to stream " + streamId + ", event '" + event
+						+ "' NOT delivered to their observers: "
+						+ Streams_Stream.describeError(err));
+					return;
+				}
+				if (!allowed) {
+					return;
+				}
+				byUser[userId].forEach(function (clientId) {
+					try {
+						observers[clientId].emit(event, messageOrEphemeral.getFields(), {
+							publisherId: stream.fields.publisherId,
+							streamName: stream.fields.name,
+							streamType: stream.fields.type,
+							messageCount: stream.fields.messageCount
+						});
+					} catch (e) {
+						// One dead socket must not abort the fan-out to the others,
+						// nor take the process down from inside an async callback.
+						Q.log("Streams.Stream.notifyObservers: emit failed for client '"
+							+ clientId + "', event '" + event + "' on stream " + streamId
+							+ ": " + Streams_Stream.describeError(e));
+					}
+				});
+			});
+		});
 	});
 };
 
@@ -1023,7 +1093,10 @@ function _applyAccessRows(subj, asUserId, rows1, rows2, lookup, callback) {
 				}
 			}
 			var p = participants[0];
-			if (p && p.testRoles(row.fields.ofParticipantRole)) {
+			// As PHP Streams::calculateAccess: a role only counts while the
+			// participant is participating (ro#1172 audit, R02).
+			if (p && p.fields.state === 'participating'
+			&& p.testRoles(row.fields.ofParticipantRole)) {
 				_setStreamAccess(subj, rows[i], Streams.ACCESS_SOURCES['participant']);
 			}
 		}
@@ -1164,8 +1237,14 @@ Sp.inheritAccess = function (callback) {
 		var permissions = ia[3];
 		Streams.fetchOne(asUserId, publisherId, name, 
 		function (err, stream) {
-			if (err) {
-				return callback.call(this, err);
+			// A missing parent row comes back as (null, null). Reading it threw
+			// inside this DB callback, which exits the process (ro#1172 audit,
+			// R04). Fail closed instead.
+			if (err || !stream) {
+				return callback.call(subj, err || new Error(
+					"Streams.Stream.inheritAccess: inherited stream "
+					+ publisherId + "/" + name + " not found"
+				));
 			}
 			// Inherit read, write and admin levels
 			// But once we obtain a level via a
@@ -1724,8 +1803,10 @@ Sp.unsubscribe = function(options, callback) {
  * @param {Function} [callback] This would be called after all the notifying was done
  * @param {Object} [accessView] The participant's access, already calculated by
  *   Streams.Stream.calculateAccessForUsers(). Otherwise it is calculated here.
+ * @param {Object} [accessDecision] Internal: {err, allowed} when the caller has
+ *   already tested the read level on accessView.
  */
-Sp.notify = function(participant, event, messageOrEphemeral, callback, accessView) {
+Sp.notify = function(participant, event, messageOrEphemeral, callback, accessView, accessDecision) {
 	var stream = this;
 	var userId = participant.fields.userId;
 	function _notify(err, access) {
@@ -1840,6 +1921,9 @@ Sp.notify = function(participant, event, messageOrEphemeral, callback, accessVie
 	// publisher's turn set publishedByFetcher for good — so one participant's
 	// access could be read as another's.
 	if (accessView && accessView.get('asUserId') === userId) {
+		if (accessDecision) {
+			return _notify(accessDecision.err, accessDecision.allowed);
+		}
 		return accessView.testReadLevel(Streams.READ_LEVEL[readLevel], _notify);
 	}
 	Streams_Stream.accessView(this).calculateAccess(userId, function (err) {
@@ -2269,56 +2353,118 @@ function _offlineNotify(stream, messageOrEphemeral, userId,
 	
 }
 
-// Process-wide limit on offline notification work in flight (ro#1172).
-// Streams/notifications/offlineConcurrency (default 10) slots; the rest wait
-// in a queue of closures. A slot is released when the participant's offline
-// notification finishes, or after Streams/notifications/offlineTimeout
-// seconds (default 60) so a delivery that never calls back cannot stall
-// every later notification.
-var _offline = { active: 0, queue: [] };
+// Process-wide limits on work in flight (ro#1172). Each limiter has
+// Streams/notifications/<name>Concurrency (default 10) slots; the rest wait
+// in a queue of closures. A slot is released when its task finishes, or after
+// Streams/notifications/<name>Timeout seconds (default 60) so a task that
+// never calls back cannot stall every later one.
+//  - offline: offline notifications to subscribed participants
+//  - inherit: access decisions that need inheritAccess (a fetchOne per
+//    inherited stream per user)
+var _limits = {
+	offline: { name: 'offline', active: 0, queue: [] },
+	inherit: { name: 'inherit', active: 0, queue: [] }
+};
 
 function _offlineSlot(task) {
-	_offline.queue.push(task);
-	_offlineNext();
+	_limited(_limits.offline, task);
 }
 
-function _offlineNext() {
-	var max = parseInt(Q.Config.get(['Streams', 'notifications', 'offlineConcurrency'], 10));
+function _limited(limit, task) {
+	limit.queue.push(task);
+	_limitNext(limit);
+}
+
+function _limitNext(limit) {
+	var max = parseInt(Q.Config.get(
+		['Streams', 'notifications', limit.name + 'Concurrency'], 10
+	));
 	if (!(max > 0)) {
 		max = 10;
 	}
-	while (_offline.active < max && _offline.queue.length) {
-		_offlineRun(_offline.queue.shift());
+	while (limit.active < max && limit.queue.length) {
+		_limitRun(limit, limit.queue.shift());
 	}
 }
 
-function _offlineRun(task) {
+function _limitRun(limit, task) {
 	var released = false;
-	var seconds = Q.Config.get(['Streams', 'notifications', 'offlineTimeout'], 60);
+	var seconds = parseFloat(Q.Config.get(
+		['Streams', 'notifications', limit.name + 'Timeout'], 60
+	));
+	// A non-numeric or zero timeout would fire at once and void the limit.
+	if (!(seconds > 0)) {
+		seconds = 60;
+	}
 	var timer = setTimeout(function () {
-		Q.log("Streams.Stream.notify: an offline notification was still running after "
+		Q.log("Streams.Stream: a " + limit.name + " task was still running after "
 			+ seconds + "s; releasing its slot");
 		release();
 	}, seconds * 1000);
-	_offline.active++;
+	if (timer.unref) {
+		timer.unref();
+	}
+	limit.active++;
 	function release() {
 		if (released) {
 			return;
 		}
 		released = true;
 		clearTimeout(timer);
-		_offline.active--;
+		limit.active--;
 		// Not synchronously: a task that finishes at once must not recurse
 		// through the whole queue on one stack.
-		setImmediate(_offlineNext);
+		setImmediate(function () {
+			_limitNext(limit);
+		});
 	}
 	try {
 		task(release);
 	} catch (e) {
-		Q.log("Streams.Stream.notify: offline notification threw: "
+		Q.log("Streams.Stream: " + limit.name + " task threw: "
 			+ Streams_Stream.describeError(e));
 		release();
 	}
+}
+
+// The read level a participant or observer needs to receive this message.
+// Throws for a null message, as notify() always has.
+function _readLevelFor(messageOrEphemeral) {
+	var t = messageOrEphemeral.getType();
+	return Streams.READ_LEVEL[
+		(t === 'Streams/left' || t === 'Streams/joined') ? 'participants' : 'messages'
+	];
+}
+
+// Decides whether the user of an access view may read at `level`, calling
+// back (err, allowed) at most once. Synchronous when the view's own levels
+// answer. When the stream inherits access, the full test (which may fetch
+// each inherited stream as that user) runs in an "inherit" slot, so a post to
+// a large stream does not start one fetchOne per participant at once.
+function _decideRead(view, level, callback) {
+	var called = false;
+	function done(err, allowed) {
+		if (called) {
+			return;
+		}
+		called = true;
+		callback(err, allowed);
+	}
+	if (view.testReadLevel(level)) {
+		return done(null, true);
+	}
+	if (!view.fields.inheritAccess) {
+		// No inheritance: the synchronous answer is the whole answer. The
+		// asynchronous form gives the same false, or no answer at all for a
+		// closed stream, exactly as notify() always did.
+		return view.testReadLevel(level, done);
+	}
+	_limited(_limits.inherit, function (release) {
+		view.testReadLevel(level, function (err, allowed) {
+			release();
+			done(err, allowed);
+		});
+	});
 }
 
 module.exports = Streams_Stream;
