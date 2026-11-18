@@ -281,6 +281,9 @@ function testLevel (subj, type, values, level, callback) {
 		return true;
 	}
 	if (subj.fields.closedTime && level !== 'close' && !subj.testWriteLevel('close')) {
+		// Answer an asynchronous caller too: returning without calling back
+		// left callers waiting forever (ro#1172 fix-review, R06).
+		callback && callback.call(subj, null, false);
 		return false;
 	}
 	var LEVEL = Streams[values];
@@ -1220,6 +1223,12 @@ Sp.inheritAccess = function (callback) {
 	var adminLevel_source = this.get('adminLevel_source', public_source);
 	var permissions_source = this.get('permissions_source', public_source);
 	
+	// '[]' (left by PHP's inheritAccessUnset) or a list with no valid entry
+	// inherits nothing. Q.Pipe with no requirements never fires, so answer
+	// here, or the caller waits forever (ro#1172 fix-review, R06).
+	if (!Q.isArrayLike(inheritAccess) || !inheritAccess.some(Q.isArrayLike)) {
+		return callback.call(subj, null, false);
+	}
 	var pipe = new Q.Pipe(inheritAccess.map(JSON.stringify), function (params) {
 		subj.set('readLevel', readLevel);
 		subj.set('writeLevel', writeLevel);
@@ -1237,7 +1246,8 @@ Sp.inheritAccess = function (callback) {
 	Q.each(inheritAccess, function (i, ia) {
 		var key = JSON.stringify(ia);
 		if (!Q.isArrayLike(ia)) {
-			return;
+			// Skipped, but its pipe slot must still be filled (R06).
+			return pipe.fill(key)(null, false);
 		}
 		var publisherId = ia[0];
 		var name = ia[1];
@@ -1383,6 +1393,9 @@ Sp.testPermission = function(permission, callback)
 		return true;
 	}
 	if (subj.fields.closedTime && level !== 'close' && !subj.testWriteLevel('close')) {
+		// Answer an asynchronous caller too: returning without calling back
+		// left callers waiting forever (ro#1172 fix-review, R06).
+		callback && callback.call(subj, null, false);
 		return false;
 	}
 	var permissions = subj.get('permissions', []);
@@ -2461,11 +2474,12 @@ function _decideRead(view, level, callback) {
 	if (view.testReadLevel(level)) {
 		return done(null, true);
 	}
-	if (!view.fields.inheritAccess) {
-		// No inheritance: the synchronous answer is the whole answer. The
-		// asynchronous form gives the same false, or no answer at all for a
-		// closed stream, exactly as notify() always did.
-		return view.testReadLevel(level, done);
+	if (!view.fields.inheritAccess
+	|| (view.fields.closedTime && !view.testWriteLevel('close'))) {
+		// No inheritance, or a closed stream (testLevel answers it before
+		// any inheritance): the synchronous answer is the whole answer, and
+		// must not take an "inherit" slot (ro#1172 fix-review, R06).
+		return done(null, false);
 	}
 	_limited(_limits.inherit, function (release) {
 		view.testReadLevel(level, function (err, allowed) {
